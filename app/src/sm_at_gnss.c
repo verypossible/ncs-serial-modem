@@ -93,6 +93,12 @@ K_FIFO_DEFINE(gnss_status_fifo);
 
 static struct modem_pipe *gnss_pipe;
 
+/* Latest PVT frame for AT#XGNSSPVT. Written in interrupt context, so guarded by a spinlock. */
+static struct k_spinlock gnss_pvt_lock;
+static struct nrf_modem_gnss_pvt_data_frame gnss_pvt_last;
+static uint32_t gnss_pvt_count;
+static int64_t gnss_pvt_uptime;
+
 /* Whether to use the nRF Cloud assistive services that were compiled in (A-GNSS/P-GPS).
  * If enabled, the connection to nRF Cloud is required during GNSS startup
  * and assistance data will be downloaded.
@@ -270,6 +276,10 @@ static int gnss_startup(void)
 		return ret;
 	}
 #endif /* CONFIG_SM_LOG_LEVEL_DBG */
+
+	K_SPINLOCK(&gnss_pvt_lock) {
+		gnss_pvt_count = 0;
+	}
 
 	ret = nrf_modem_gnss_start();
 	if (ret) {
@@ -544,6 +554,7 @@ static void on_gnss_evt_nmea(void)
 	assert(!strcmp(nmea_str + len, "\r\n"));
 	LOG_DBG("%.*s", len, nmea_str);
 }
+#endif /* CONFIG_SM_LOG_LEVEL_DBG */
 
 static void on_gnss_evt_pvt(void)
 {
@@ -555,6 +566,13 @@ static void on_gnss_evt_pvt(void)
 		LOG_ERR("Failed to read GNSS PVT data: %d", err);
 		return;
 	}
+
+	K_SPINLOCK(&gnss_pvt_lock) {
+		gnss_pvt_last = pvt;
+		gnss_pvt_count++;
+		gnss_pvt_uptime = k_uptime_get();
+	}
+
 	for (int i = 0; i < NRF_MODEM_GNSS_MAX_SATELLITES; ++i) {
 		if (pvt.sv[i].sv) { /* SV number 0 indicates no satellite */
 			LOG_DBG("SV:%3d sig:%d c/n0:%4d el:%3d az:%3d in-fix:%d unhealthy:%d",
@@ -565,7 +583,6 @@ static void on_gnss_evt_pvt(void)
 		}
 	}
 }
-#endif /* CONFIG_SM_LOG_LEVEL_DBG */
 
 #if defined(CONFIG_SM_NRF_CLOUD)
 static int do_cloud_send_obj(struct nrf_cloud_obj *const obj)
@@ -717,10 +734,10 @@ static void on_gnss_evt_fix(void)
 static void gnss_event_handler(int event)
 {
 	switch (event) {
-#if defined(CONFIG_SM_LOG_LEVEL_DBG)
 	case NRF_MODEM_GNSS_EVT_PVT:
 		on_gnss_evt_pvt();
 		break;
+#if defined(CONFIG_SM_LOG_LEVEL_DBG)
 	case NRF_MODEM_GNSS_EVT_NMEA:
 		on_gnss_evt_nmea();
 		break;
@@ -916,6 +933,64 @@ static int handle_at_gnss_delete(enum at_parser_cmd_type cmd_type, struct at_par
 	}
 
 	return err;
+}
+
+/* Reports the latest PVT frame: a summary line, then one line per tracked satellite. */
+SM_AT_CMD_CUSTOM(xgnsspvt, "AT#XGNSSPVT", handle_at_gnss_pvt);
+static int handle_at_gnss_pvt(enum at_parser_cmd_type cmd_type, struct at_parser *, uint32_t)
+{
+	struct nrf_modem_gnss_pvt_data_frame pvt;
+	uint32_t count;
+	int64_t uptime;
+	int tracked = 0;
+	int used = 0;
+
+	switch (cmd_type) {
+	case AT_PARSER_CMD_TYPE_READ:
+		break;
+
+	case AT_PARSER_CMD_TYPE_TEST:
+		rsp_send("\r\n#XGNSSPVT: <count>,<age_ms>,<flags>,<exec_ms>,<tracked>,<used>\r\n"
+			 "\r\n#XGNSSSV: <sv>,<signal>,<cn0>,<elevation>,<azimuth>,<flags>\r\n");
+		return 0;
+
+	default:
+		return -EINVAL;
+	}
+
+	K_SPINLOCK(&gnss_pvt_lock) {
+		pvt = gnss_pvt_last;
+		count = gnss_pvt_count;
+		uptime = gnss_pvt_uptime;
+	}
+
+	if (count == 0) {
+		rsp_send("\r\n#XGNSSPVT: 0\r\n");
+		return 0;
+	}
+
+	for (int i = 0; i < NRF_MODEM_GNSS_MAX_SATELLITES; ++i) {
+		if (pvt.sv[i].sv) {
+			tracked++;
+			if (pvt.sv[i].flags & NRF_MODEM_GNSS_SV_FLAG_USED_IN_FIX) {
+				used++;
+			}
+		}
+	}
+
+	rsp_send("\r\n#XGNSSPVT: %u,%u,%u,%u,%d,%d\r\n", (unsigned int)count,
+		 (unsigned int)(k_uptime_get() - uptime), pvt.flags,
+		 (unsigned int)pvt.execution_time, tracked, used);
+
+	for (int i = 0; i < NRF_MODEM_GNSS_MAX_SATELLITES; ++i) {
+		if (pvt.sv[i].sv) {
+			rsp_send("\r\n#XGNSSSV: %u,%u,%u,%d,%d,%u\r\n", pvt.sv[i].sv,
+				 pvt.sv[i].signal, pvt.sv[i].cn0, pvt.sv[i].elevation,
+				 pvt.sv[i].azimuth, pvt.sv[i].flags);
+		}
+	}
+
+	return 0;
 }
 
 static void sm_at_gnss_cb_init(int ret, void *ctx)
