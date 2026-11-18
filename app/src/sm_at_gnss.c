@@ -99,6 +99,17 @@ static struct nrf_modem_gnss_pvt_data_frame gnss_pvt_last;
 static uint32_t gnss_pvt_count;
 static int64_t gnss_pvt_uptime;
 
+/* AT#XGNSSPVT=<mode>[,<every>] URC reporting. Mode and divider are guarded by gnss_pvt_lock. */
+enum gnss_pvt_urc_mode {
+	GNSS_PVT_URC_OFF,
+	GNSS_PVT_URC_SUMMARY,
+	GNSS_PVT_URC_FULL,
+};
+static enum gnss_pvt_urc_mode gnss_pvt_urc_mode;
+static uint16_t gnss_pvt_urc_every = 1;
+static struct modem_pipe *gnss_pvt_pipe;
+static struct k_work gnss_pvt_urc_work;
+
 /* Whether to use the nRF Cloud assistive services that were compiled in (A-GNSS/P-GPS).
  * If enabled, the connection to nRF Cloud is required during GNSS startup
  * and assistance data will be downloaded.
@@ -113,6 +124,23 @@ static uint16_t gnss_cloud_assistance;
  * this is to remember that A/P-GPS data was requested if cloud assistance gets enabled.
  */
 static bool gnss_gps_req_to_send;
+
+/* Dynamics mode for AT#XGNSSDYN. The modem keeps it in NVM but accepts it only while GNSS
+ * runs, so it is applied at the first start after boot, and again when changed.
+ */
+static uint32_t gnss_dyn_mode = NRF_MODEM_GNSS_DYNAMICS_STATIONARY;
+static bool gnss_dyn_applied;
+
+static int gnss_dyn_apply(void)
+{
+	int ret = nrf_modem_gnss_dyn_mode_change(gnss_dyn_mode);
+
+	gnss_dyn_applied = (ret == 0);
+	if (ret) {
+		LOG_ERR("Failed to set GNSS dynamics mode %u: %d", gnss_dyn_mode, ret);
+	}
+	return ret;
+}
 
 static bool is_gnss_activated(void)
 {
@@ -163,8 +191,6 @@ static void gnss_status_set(enum gnss_status status)
 	}
 }
 
-#if defined(CONFIG_SM_NRF_CLOUD) && defined(CONFIG_NRF_CLOUD_AGNSS)
-
 static int64_t utc_to_gps_sec(const int64_t utc_sec)
 {
 	return (utc_sec - GPS_TO_UNIX_UTC_OFFSET_SECONDS) + GPS_TO_UTC_LEAP_SECONDS;
@@ -175,7 +201,6 @@ static void gps_sec_to_day_time(int64_t gps_sec, uint16_t *gps_day, uint32_t *gp
 	*gps_day = (uint16_t)(gps_sec / SEC_PER_DAY);
 	*gps_time_of_day = (uint32_t)(gps_sec % SEC_PER_DAY);
 }
-#endif
 
 static void on_gnss_evt_agnss_req(void)
 {
@@ -290,6 +315,11 @@ static int gnss_startup(void)
 	gnss_ttff_start = k_uptime_get();
 	gnss_status_set(GNSS_STATUS_STARTED);
 	LOG_INF("GNSS started with%s cloud assistance", gnss_cloud_assistance ? "" : "out");
+
+	/* A failure leaves the modem's stored mode in force; retried at the next start. */
+	if (!gnss_dyn_applied) {
+		(void)gnss_dyn_apply();
+	}
 
 	if (gnss_gps_req_to_send) {
 		on_gnss_evt_agnss_req();
@@ -559,6 +589,7 @@ static void on_gnss_evt_nmea(void)
 static void on_gnss_evt_pvt(void)
 {
 	struct nrf_modem_gnss_pvt_data_frame pvt;
+	bool report = false;
 	int err;
 
 	err = nrf_modem_gnss_read((void *)&pvt, sizeof(pvt), NRF_MODEM_GNSS_DATA_PVT);
@@ -571,6 +602,13 @@ static void on_gnss_evt_pvt(void)
 		gnss_pvt_last = pvt;
 		gnss_pvt_count++;
 		gnss_pvt_uptime = k_uptime_get();
+		report = gnss_pvt_urc_mode != GNSS_PVT_URC_OFF &&
+			 (gnss_pvt_count % gnss_pvt_urc_every) == 0;
+	}
+
+	/* Interrupt context: the URC is sent from sm_work_q. */
+	if (report) {
+		k_work_submit_to_queue(&sm_work_q, &gnss_pvt_urc_work);
 	}
 
 	for (int i = 0; i < NRF_MODEM_GNSS_MAX_SATELLITES; ++i) {
@@ -907,6 +945,122 @@ static int handle_at_gnss(enum at_parser_cmd_type cmd_type, struct at_parser *pa
 	return err;
 }
 
+/* Sets the GNSS dynamics mode. While GNSS is stopped it is applied at the next start. */
+SM_AT_CMD_CUSTOM(xgnssdyn, "AT#XGNSSDYN", handle_at_gnss_dyn);
+static int handle_at_gnss_dyn(enum at_parser_cmd_type cmd_type, struct at_parser *parser,
+			      uint32_t param_count)
+{
+	uint16_t mode;
+	int err;
+
+	switch (cmd_type) {
+	case AT_PARSER_CMD_TYPE_SET:
+		err = at_parser_num_get(parser, 1, &mode);
+		if (err || param_count != 2 || mode > NRF_MODEM_GNSS_DYNAMICS_AUTOMOTIVE) {
+			return -EINVAL;
+		}
+		if (mode != gnss_dyn_mode) {
+			gnss_dyn_mode = mode;
+			gnss_dyn_applied = false;
+		}
+		if (gnss_running && !gnss_dyn_applied) {
+			return gnss_dyn_apply();
+		}
+		return 0;
+
+	case AT_PARSER_CMD_TYPE_READ:
+		rsp_send("\r\n#XGNSSDYN: %u,%d\r\n", gnss_dyn_mode, (int)gnss_dyn_applied);
+		return 0;
+
+	case AT_PARSER_CMD_TYPE_TEST:
+		rsp_send("\r\n#XGNSSDYN: (0,1,2,3)\r\n");
+		return 0;
+
+	default:
+		return -EINVAL;
+	}
+}
+
+/* Whether GNSS knows the GPS system time. */
+static int gnss_time_known(bool *known)
+{
+	/* About 800 bytes; AT commands are handled one at a time. */
+	static struct nrf_modem_gnss_agnss_expiry expiry;
+	int err = nrf_modem_gnss_agnss_expiry_get(&expiry);
+
+	if (err) {
+		LOG_ERR("Failed to read GNSS A-GNSS expiry: %d", err);
+		return err;
+	}
+	*known = !(expiry.data_flags & NRF_MODEM_GNSS_AGNSS_GPS_SYS_TIME_AND_SV_TOW_REQUEST);
+	return 0;
+}
+
+/* Injects UTC time into GNSS, unless it already knows the time. */
+SM_AT_CMD_CUSTOM(xgnsstime, "AT#XGNSSTIME", handle_at_gnss_time);
+static int handle_at_gnss_time(enum at_parser_cmd_type cmd_type, struct at_parser *parser,
+			       uint32_t param_count)
+{
+	static struct nrf_modem_gnss_agnss_gps_data_system_time_and_sv_tow gps_time;
+	int64_t utc_sec;
+	uint16_t utc_ms = 0;
+	bool known;
+	int err;
+
+	switch (cmd_type) {
+	case AT_PARSER_CMD_TYPE_SET:
+		err = at_parser_num_get(parser, 1, &utc_sec);
+		if (err || param_count > 3 || utc_sec < GPS_TO_UNIX_UTC_OFFSET_SECONDS) {
+			return -EINVAL;
+		}
+		if (param_count == 3) {
+			err = at_parser_num_get(parser, 2, &utc_ms);
+			if (err || utc_ms > 999) {
+				return -EINVAL;
+			}
+		}
+
+		err = gnss_time_known(&known);
+		if (err) {
+			return err;
+		}
+		if (known) {
+			rsp_send("\r\n#XGNSSTIME: 0\r\n");
+			return 0;
+		}
+
+		memset(&gps_time, 0, sizeof(gps_time));
+		gps_sec_to_day_time(utc_to_gps_sec(utc_sec), &gps_time.date_day,
+				    &gps_time.time_full_s);
+		gps_time.time_frac_ms = utc_ms;
+		err = nrf_modem_gnss_agnss_write(&gps_time, sizeof(gps_time),
+						 NRF_MODEM_GNSS_AGNSS_GPS_SYSTEM_CLOCK_AND_TOWS);
+		if (err) {
+			LOG_ERR("Failed to inject GNSS time: %d", err);
+			return err;
+		}
+		LOG_INF("GNSS time injected day=%u time=%u", gps_time.date_day,
+			gps_time.time_full_s);
+		rsp_send("\r\n#XGNSSTIME: 1\r\n");
+		return 0;
+
+	case AT_PARSER_CMD_TYPE_READ:
+		err = gnss_time_known(&known);
+		if (err) {
+			return err;
+		}
+		rsp_send("\r\n#XGNSSTIME: %d\r\n", (int)known);
+		return 0;
+
+	case AT_PARSER_CMD_TYPE_TEST:
+		rsp_send("\r\n#XGNSSTIME: <utc_s>,<ms>\r\n");
+		return 0;
+
+	default:
+		return -EINVAL;
+	}
+}
+
 SM_AT_CMD_CUSTOM(xgnssdel, "AT#XGNSSDEL", handle_at_gnss_delete);
 static int handle_at_gnss_delete(enum at_parser_cmd_type cmd_type, struct at_parser *parser,
 				uint32_t)
@@ -935,28 +1089,19 @@ static int handle_at_gnss_delete(enum at_parser_cmd_type cmd_type, struct at_par
 	return err;
 }
 
-/* Reports the latest PVT frame: a summary line, then one line per tracked satellite. */
-SM_AT_CMD_CUSTOM(xgnsspvt, "AT#XGNSSPVT", handle_at_gnss_pvt);
-static int handle_at_gnss_pvt(enum at_parser_cmd_type cmd_type, struct at_parser *, uint32_t)
+/* Summary line plus one line per tracked satellite. */
+#define GNSS_PVT_FMT_SIZE (64 + NRF_MODEM_GNSS_MAX_SATELLITES * 56)
+
+/* Formats the latest PVT frame into a static buffer. Only call from sm_work_q. */
+static const char *gnss_pvt_format(bool with_sv)
 {
-	struct nrf_modem_gnss_pvt_data_frame pvt;
+	static struct nrf_modem_gnss_pvt_data_frame pvt;
+	static char buf[GNSS_PVT_FMT_SIZE];
 	uint32_t count;
 	int64_t uptime;
 	int tracked = 0;
 	int used = 0;
-
-	switch (cmd_type) {
-	case AT_PARSER_CMD_TYPE_READ:
-		break;
-
-	case AT_PARSER_CMD_TYPE_TEST:
-		rsp_send("\r\n#XGNSSPVT: <count>,<age_ms>,<flags>,<exec_ms>,<tracked>,<used>\r\n"
-			 "\r\n#XGNSSSV: <sv>,<signal>,<cn0>,<elevation>,<azimuth>,<flags>\r\n");
-		return 0;
-
-	default:
-		return -EINVAL;
-	}
+	size_t len;
 
 	K_SPINLOCK(&gnss_pvt_lock) {
 		pvt = gnss_pvt_last;
@@ -965,8 +1110,7 @@ static int handle_at_gnss_pvt(enum at_parser_cmd_type cmd_type, struct at_parser
 	}
 
 	if (count == 0) {
-		rsp_send("\r\n#XGNSSPVT: 0\r\n");
-		return 0;
+		return "\r\n#XGNSSPVT: 0\r\n";
 	}
 
 	for (int i = 0; i < NRF_MODEM_GNSS_MAX_SATELLITES; ++i) {
@@ -978,19 +1122,79 @@ static int handle_at_gnss_pvt(enum at_parser_cmd_type cmd_type, struct at_parser
 		}
 	}
 
-	rsp_send("\r\n#XGNSSPVT: %u,%u,%u,%u,%d,%d\r\n", (unsigned int)count,
-		 (unsigned int)(k_uptime_get() - uptime), pvt.flags,
-		 (unsigned int)pvt.execution_time, tracked, used);
+	len = snprintf(buf, sizeof(buf), "\r\n#XGNSSPVT: %u,%u,%u,%u,%d,%d\r\n",
+		       (unsigned int)count, (unsigned int)(k_uptime_get() - uptime), pvt.flags,
+		       (unsigned int)pvt.execution_time, tracked, used);
 
-	for (int i = 0; i < NRF_MODEM_GNSS_MAX_SATELLITES; ++i) {
+	for (int i = 0; with_sv && i < NRF_MODEM_GNSS_MAX_SATELLITES && len < sizeof(buf); ++i) {
 		if (pvt.sv[i].sv) {
-			rsp_send("\r\n#XGNSSSV: %u,%u,%u,%d,%d,%u\r\n", pvt.sv[i].sv,
-				 pvt.sv[i].signal, pvt.sv[i].cn0, pvt.sv[i].elevation,
-				 pvt.sv[i].azimuth, pvt.sv[i].flags);
+			len += snprintf(buf + len, sizeof(buf) - len,
+					"\r\n#XGNSSSV: %u,%u,%u,%d,%d,%u\r\n", pvt.sv[i].sv,
+					pvt.sv[i].signal, pvt.sv[i].cn0, pvt.sv[i].elevation,
+					pvt.sv[i].azimuth, pvt.sv[i].flags);
 		}
 	}
 
-	return 0;
+	return buf;
+}
+
+static void gnss_pvt_urc_sender(struct k_work *)
+{
+	enum gnss_pvt_urc_mode mode;
+
+	K_SPINLOCK(&gnss_pvt_lock) {
+		mode = gnss_pvt_urc_mode;
+	}
+
+	if (mode != GNSS_PVT_URC_OFF) {
+		urc_send_to(gnss_pvt_pipe, "%s", gnss_pvt_format(mode == GNSS_PVT_URC_FULL));
+	}
+}
+
+/* AT#XGNSSPVT? polls the latest PVT frame. AT#XGNSSPVT=<mode>[,<every>] subscribes to it as a
+ * URC on every <every>-th PVT event: mode 0 off, 1 summary, 2 summary and satellites.
+ */
+SM_AT_CMD_CUSTOM(xgnsspvt, "AT#XGNSSPVT", handle_at_gnss_pvt);
+static int handle_at_gnss_pvt(enum at_parser_cmd_type cmd_type, struct at_parser *parser,
+			      uint32_t param_count)
+{
+	uint16_t mode;
+	uint16_t every = 1;
+	int err;
+
+	switch (cmd_type) {
+	case AT_PARSER_CMD_TYPE_SET:
+		err = at_parser_num_get(parser, 1, &mode);
+		if (err || mode > GNSS_PVT_URC_FULL || param_count > 3) {
+			return -EINVAL;
+		}
+		if (param_count == 3) {
+			err = at_parser_num_get(parser, 2, &every);
+			if (err || every == 0) {
+				return -EINVAL;
+			}
+		}
+
+		gnss_pvt_pipe = sm_at_host_get_current_pipe();
+		K_SPINLOCK(&gnss_pvt_lock) {
+			gnss_pvt_urc_mode = mode;
+			gnss_pvt_urc_every = every;
+		}
+		return 0;
+
+	case AT_PARSER_CMD_TYPE_READ:
+		rsp_send("%s", gnss_pvt_format(true));
+		return 0;
+
+	case AT_PARSER_CMD_TYPE_TEST:
+		rsp_send("\r\n#XGNSSPVT: (0,1,2),<every>\r\n"
+			 "\r\n#XGNSSPVT: <count>,<age_ms>,<flags>,<exec_ms>,<tracked>,<used>\r\n"
+			 "\r\n#XGNSSSV: <sv>,<signal>,<cn0>,<elevation>,<azimuth>,<flags>\r\n");
+		return 0;
+
+	default:
+		return -EINVAL;
+	}
 }
 
 static void sm_at_gnss_cb_init(int ret, void *ctx)
@@ -1020,6 +1224,7 @@ static int sm_at_gnss_init(void)
 #endif /* CONFIG_NRF_CLOUD_PGPS */
 #endif /* CONFIG_SM_NRF_CLOUD */
 	k_work_init(&gnss_fix_send_work, gnss_fix_sender);
+	k_work_init(&gnss_pvt_urc_work, gnss_pvt_urc_sender);
 
 	return 0;
 }

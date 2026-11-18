@@ -349,6 +349,405 @@ Example
 
   OK
 
+GNSS dynamics mode #XGNSSDYN
+============================
+
+The ``#XGNSSDYN`` command selects the GNSS dynamics mode, which tunes positioning for how the device moves.
+The default is stationary.
+
+The modem accepts a dynamics mode only while GNSS is running, and stores it in non-volatile memory.
+The selected mode is applied when GNSS is first started after boot, and again when it is changed.
+
+Set command
+-----------
+
+The set command allows you to select the dynamics mode.
+If GNSS is running, the mode is applied immediately.
+Otherwise, it is applied when GNSS is next started with ``#XGNSS``.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XGNSSDYN=<mode>
+
+The parameters and their defined values are the following:
+
+<mode>
+   * ``0`` - General purpose.
+   * ``1`` - Stationary (default).
+   * ``2`` - Pedestrian.
+   * ``3`` - Automotive.
+
+Example
+~~~~~~~
+
+::
+
+  AT#XGNSSDYN=2
+  OK
+
+Read command
+------------
+
+The read command allows you to check the selected mode, and whether the modem has accepted it since boot.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XGNSSDYN?
+
+Response syntax
+~~~~~~~~~~~~~~~
+
+::
+
+   #XGNSSDYN: <mode>,<applied>
+
+<mode>
+   The selected mode, as in the set command.
+
+<applied>
+   * ``0`` - Not yet applied. It is applied when GNSS is next started.
+   * ``1`` - Applied.
+
+Example
+~~~~~~~
+
+::
+
+  AT#XGNSSDYN?
+
+  #XGNSSDYN: 1,1
+
+  OK
+
+Test command
+------------
+
+The test command tests the existence of the command and provides information about the type of its subparameters.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XGNSSDYN=?
+
+Example
+~~~~~~~
+
+::
+
+  AT#XGNSSDYN=?
+
+  #XGNSSDYN: (0,1,2,3)
+
+  OK
+
+GNSS time #XGNSSTIME
+====================
+
+The ``#XGNSSTIME`` command gives GNSS the current time from the host.
+
+GNSS loses the GPS system time when the modem resets or powers off, although its stored almanacs and ephemerides survive.
+Without the time, it cannot use them to predict which satellites are visible, and searches as in a cold start.
+Injecting the time before starting GNSS lets it use the stored data.
+
+The command requires GNSS to be enabled in the system mode and the functional mode, for example after ``AT+CFUN=31``.
+
+Set command
+-----------
+
+The set command injects the given UTC time into GNSS, unless GNSS already knows the time.
+Send it before starting GNSS with ``#XGNSS``.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XGNSSTIME=<utc_s>[,<ms>]
+
+The parameters and their defined values are the following:
+
+<utc_s>
+   Integer.
+   UTC time in seconds since 1970-01-01 (Unix time).
+   It must not be earlier than the GPS epoch, 1980-01-06.
+
+<ms>
+   Integer.
+   Milliseconds part of the time, ``0`` to ``999``.
+   The default is ``0``.
+
+Response syntax
+~~~~~~~~~~~~~~~
+
+::
+
+   #XGNSSTIME: <injected>
+
+<injected>
+   * ``0`` - Not injected, because GNSS already knows the time.
+   * ``1`` - Injected.
+
+Example
+~~~~~~~
+
+::
+
+  AT+CFUN=31
+  OK
+  AT#XGNSSTIME=1795046400
+  #XGNSSTIME: 1
+  OK
+  AT#XGNSS=1,0,0,0
+  OK
+
+Read command
+------------
+
+The read command allows you to check whether GNSS knows the time.
+It cannot return the time itself.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XGNSSTIME?
+
+Response syntax
+~~~~~~~~~~~~~~~
+
+::
+
+   #XGNSSTIME: <known>
+
+<known>
+   * ``0`` - GNSS does not know the time.
+   * ``1`` - GNSS knows the time.
+
+Example
+~~~~~~~
+
+::
+
+  AT#XGNSSTIME?
+
+  #XGNSSTIME: 1
+
+  OK
+
+Test command
+------------
+
+The test command tests the existence of the command and provides information about the type of its subparameters.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XGNSSTIME=?
+
+Example
+~~~~~~~
+
+::
+
+  AT#XGNSSTIME=?
+
+  #XGNSSTIME: <utc_s>,<ms>
+
+  OK
+
+GNSS PVT status #XGNSSPVT
+=========================
+
+The ``#XGNSSPVT`` command reports the latest PVT (position, velocity, and time) frame from GNSS: a summary, and the satellites it is tracking.
+It is meant for debugging GNSS reception, for example to see how many satellites are tracked and their signal strength while waiting for a fix.
+
+.. note::
+   This is a debug feature.
+
+Set command
+-----------
+
+The set command allows you to subscribe to PVT frames as unsolicited notifications.
+The notifications are sent to the channel the command was issued on.
+The setting is kept when GNSS is stopped and started again.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XGNSSPVT=<mode>[,<every>]
+
+The parameters and their defined values are the following:
+
+<mode>
+   * ``0`` - No notifications (default).
+   * ``1`` - ``#XGNSSPVT`` summary only.
+   * ``2`` - ``#XGNSSPVT`` summary followed by one ``#XGNSSSV`` line per tracked satellite.
+
+<every>
+   Integer.
+   Send a notification on every ``<every>``-th PVT frame, counted from the start of GNSS.
+   The default is ``1``, which is every frame.
+   In continuous navigation mode, GNSS produces a PVT frame every second.
+
+Unsolicited notification
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+The notifications have the same syntax as the read command response.
+
+Example
+~~~~~~~
+
+::
+
+  AT#XGNSSPVT=1,10
+  OK
+  AT#XGNSS=1,0,0,0
+  OK
+
+  #XGNSSPVT: 10,1,0,10003,4,0
+
+  #XGNSSPVT: 20,1,0,20005,6,0
+
+  #XGNSSPVT: 30,0,1,30002,7,5
+
+Read command
+------------
+
+The read command allows you to read the latest PVT frame, a summary followed by one line per tracked satellite.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XGNSSPVT?
+
+Response syntax
+~~~~~~~~~~~~~~~
+
+::
+
+   #XGNSSPVT: <count>,<age_ms>,<flags>,<exec_ms>,<tracked>,<used>
+   #XGNSSSV: <sv>,<signal>,<cn0>,<elevation>,<azimuth>,<sv_flags>
+   ...
+
+If GNSS has produced no PVT frame since it was started, the response is ``#XGNSSPVT: 0``, without the other fields.
+
+<count>
+   Integer.
+   Number of PVT frames since GNSS was started.
+
+<age_ms>
+   Integer.
+   Milliseconds since the frame was received.
+
+<flags>
+   Integer.
+   A bitwise ``OR`` of the following bitmasks:
+
+   * ``0x01`` - Fix valid.
+   * ``0x02`` - Leap second valid.
+   * ``0x04`` - GNSS slept between PVT frames (power saving).
+   * ``0x08`` - GNSS missed its deadline because of LTE activity.
+   * ``0x10`` - Not enough time windows were given to GNSS because of LTE activity.
+   * ``0x20`` - Velocity valid.
+   * ``0x40`` - GNSS is downloading ephemerides or almanacs from the satellites.
+
+<exec_ms>
+   Integer.
+   Cumulative GNSS execution time since it was started, in milliseconds.
+
+<tracked>
+   Integer.
+   Number of satellites being tracked.
+
+<used>
+   Integer.
+   Number of tracked satellites used in the fix.
+
+<sv>
+   Integer.
+   Satellite ID.
+
+<signal>
+   * ``1`` - GPS L1 C/A.
+   * ``3`` - QZSS L1 C/A.
+   * ``4`` - Galileo E1.
+
+<cn0>
+   Integer.
+   Carrier-to-noise density ratio, in units of 0.1 dB-Hz.
+
+<elevation>
+   Integer.
+   Satellite elevation angle in degrees.
+
+<azimuth>
+   Integer.
+   Satellite azimuth angle in degrees.
+
+<sv_flags>
+   Integer.
+   A bitwise ``OR`` of the following bitmasks:
+
+   * ``0x02`` - Used in the fix.
+   * ``0x08`` - Unhealthy.
+
+Example
+~~~~~~~
+
+::
+
+  AT#XGNSSPVT?
+
+  #XGNSSPVT: 42,312,1,42008,2,2
+
+  #XGNSSSV: 5,1,412,63,112,2
+
+  #XGNSSSV: 12,1,385,41,287,2
+
+  OK
+
+Test command
+------------
+
+The test command tests the existence of the command and provides information about the type of its subparameters.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XGNSSPVT=?
+
+Example
+~~~~~~~
+
+::
+
+  AT#XGNSSPVT=?
+
+  #XGNSSPVT: (0,1,2),<every>
+
+  #XGNSSPVT: <count>,<age_ms>,<flags>,<exec_ms>,<tracked>,<used>
+
+  #XGNSSSV: <sv>,<signal>,<cn0>,<elevation>,<azimuth>,<flags>
+
+  OK
+
 Delete GNSS data #XGNSSDEL
 ==========================
 
