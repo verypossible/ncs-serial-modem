@@ -66,6 +66,10 @@ The parameters and their defined values are the following:
 .. note::
    Returns ``ERROR`` if ``AT#XTRACE=1`` has been issued.
 
+.. note::
+   When the application logs through another backend, such as SEGGER RTT (:file:`rtt.conf`), the command does not touch the UART or the log backend.
+   Logs keep going to that backend in every mode, and ``<mode>`` only selects how AT traffic is logged.
+
 Read command
 ------------
 

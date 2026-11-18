@@ -327,11 +327,8 @@ void sm_log_tx(const uint8_t *data, size_t len)
 SM_AT_CMD_CUSTOM(xlog, "AT#XLOG", handle_at_log);
 STATIC int handle_at_log(enum at_parser_cmd_type cmd_type, struct at_parser *parser, uint32_t)
 {
+	/* NULL when logging uses another backend, such as RTT. Only the mode changes then. */
 	const struct log_backend *log_be = log_backend_get_by_name("log_backend_uart");
-
-	if (!log_be) {
-		return -ENODEV;
-	}
 
 	if (cmd_type == AT_PARSER_CMD_TYPE_SET) {
 		int mode;
@@ -345,7 +342,7 @@ STATIC int handle_at_log(enum at_parser_cmd_type cmd_type, struct at_parser *par
 
 		const bool want_on = (mode > SM_LOG_MODE_OFF);
 
-		if (want_on && !log_active) {
+		if (log_be && want_on && !log_active) {
 			if (uart_is_active()) {
 				return -EBUSY;
 			}
@@ -358,7 +355,7 @@ STATIC int handle_at_log(enum at_parser_cmd_type cmd_type, struct at_parser *par
 			}
 			log_backend_enable(log_be, log_be->cb->ctx, CONFIG_LOG_DEFAULT_LEVEL);
 			log_active = true;
-		} else if (!want_on && log_active) {
+		} else if (log_be && !want_on && log_active) {
 			log_backend_disable(log_be);
 			ret = uart_suspend();
 			if (ret) {
